@@ -52,7 +52,7 @@
     "webtorrent-fixtures": "^1.3.0"
   },
   "optionalDependencies": {
-    "bufferutil": "^3.0.0"
+    "bufferutil": "^3.0.3"
   },
   "keywords": [
     "bittorrent",
