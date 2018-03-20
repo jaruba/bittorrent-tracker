@@ -1,296 +1,561 @@
 module.exports = Client
 
-var Buffer = require('safe-buffer').Buffer
-var debug = require('debug')('bittorrent-tracker:client')
+var bencode = require('bencode')
+var BN = require('bn.js')
+var common = require('./lib/common')
+var compact2string = require('compact2string')
+var concat = require('concat-stream')
+var debug = require('debug')('bittorrent-tracker')
+var dgram = require('dgram')
 var EventEmitter = require('events').EventEmitter
-var extend = require('xtend')
+var extend = require('extend.js')
+var hat = require('hat')
+var http = require('http')
 var inherits = require('inherits')
 var once = require('once')
-var parallel = require('run-parallel')
-var Peer = require('simple-peer')
-var uniq = require('uniq')
 var url = require('url')
-
-var common = require('./lib/common')
-var HTTPTracker = require('./lib/client/http-tracker') // empty object in browser
-var UDPTracker = require('./lib/client/udp-tracker') // empty object in browser
-var WebSocketTracker = require('./lib/client/websocket-tracker')
 
 inherits(Client, EventEmitter)
 
 /**
- * BitTorrent tracker client.
+ * A Client manages tracker connections for a torrent.
  *
- * Find torrent peers, to help a torrent client participate in a torrent swarm.
- *
- * @param {Object} opts                          options object
- * @param {string|Buffer} opts.infoHash          torrent info hash
- * @param {string|Buffer} opts.peerId            peer id
- * @param {string|Array.<string>} opts.announce  announce
- * @param {number} opts.port                     torrent client listening port
- * @param {function} opts.getAnnounceOpts        callback to provide data to tracker
- * @param {number} opts.rtcConfig                RTCPeerConnection configuration object
- * @param {number} opts.userAgent                User-Agent header for http requests
- * @param {number} opts.wrtc                     custom webrtc impl (useful in node.js)
+ * @param {string} peerId  this peer's id
+ * @param {Number} port    port number that the client is listening on
+ * @param {Object} torrent parsed torrent
+ * @param {Object} opts    optional options
+ * @param {Number} opts.numWant    number of peers to request
+ * @param {Number} opts.interval   interval in ms to send announce requests to the tracker
  */
-function Client (opts) {
+function Client (peerId, port, torrent, opts) {
   var self = this
-  if (!(self instanceof Client)) return new Client(opts)
+  if (!(self instanceof Client)) return new Client(peerId, port, torrent, opts)
   EventEmitter.call(self)
-  if (!opts) opts = {}
+  self._opts = opts || {}
 
-  if (!opts.peerId) throw new Error('Option `peerId` is required')
-  if (!opts.infoHash) throw new Error('Option `infoHash` is required')
-  if (!opts.announce) throw new Error('Option `announce` is required')
-  if (!process.browser && !opts.port) throw new Error('Option `port` is required')
+  // required
+  self._peerId = Buffer.isBuffer(peerId)
+    ? peerId
+    : new Buffer(peerId, 'utf8')
+  self._port = port
+  self._infoHash = Buffer.isBuffer(torrent.infoHash)
+    ? torrent.infoHash
+    : new Buffer(torrent.infoHash, 'hex')
+  self.torrentLength = torrent.length
 
-  self.peerId = typeof opts.peerId === 'string'
-    ? opts.peerId
-    : opts.peerId.toString('hex')
-  self._peerIdBuffer = Buffer.from(self.peerId, 'hex')
-  self._peerIdBinary = self._peerIdBuffer.toString('binary')
+  // optional
+  self._numWant = self._opts.numWant || 50
+  self._intervalMs = self._opts.interval || (30 * 60 * 1000) // default: 30 minutes
 
-  self.infoHash = typeof opts.infoHash === 'string'
-    ? opts.infoHash
-    : opts.infoHash.toString('hex')
-  self._infoHashBuffer = Buffer.from(self.infoHash, 'hex')
-  self._infoHashBinary = self._infoHashBuffer.toString('binary')
+  debug('new client %s', self._infoHash.toString('hex'))
 
-  debug('new client %s', self.infoHash)
-
-  self.destroyed = false
-
-  self._port = opts.port
-  self._getAnnounceOpts = opts.getAnnounceOpts
-  self._rtcConfig = opts.rtcConfig
-  self._userAgent = opts.userAgent
-
-  // Support lazy 'wrtc' module initialization
-  // See: https://github.com/webtorrent/webtorrent-hybrid/issues/46
-  self._wrtc = typeof opts.wrtc === 'function' ? opts.wrtc() : opts.wrtc
-
-  var announce = typeof opts.announce === 'string'
-    ? [ opts.announce ]
-    : opts.announce == null ? [] : opts.announce
-
-  // Remove trailing slash from trackers to catch duplicates
-  announce = announce.map(function (announceUrl) {
-    announceUrl = announceUrl.toString()
-    if (announceUrl[announceUrl.length - 1] === '/') {
-      announceUrl = announceUrl.substring(0, announceUrl.length - 1)
-    }
-    return announceUrl
-  })
-  announce = uniq(announce)
-
-  var webrtcSupport = self._wrtc !== false && (!!self._wrtc || Peer.WEBRTC_SUPPORT)
-
-  self._trackers = announce
+  if (typeof torrent.announce === 'string') torrent.announce = [ torrent.announce ]
+  self._trackers = (torrent.announce || [])
+    .filter(function (announceUrl) {
+      return announceUrl.indexOf('udp://') === 0 || announceUrl.indexOf('http://') === 0
+    })
     .map(function (announceUrl) {
-      var protocol = url.parse(announceUrl).protocol
-      if ((protocol === 'http:' || protocol === 'https:') &&
-          typeof HTTPTracker === 'function') {
-        return new HTTPTracker(self, announceUrl)
-      } else if (protocol === 'udp:' && typeof UDPTracker === 'function') {
-        return new UDPTracker(self, announceUrl)
-      } else if ((protocol === 'ws:' || protocol === 'wss:') && webrtcSupport) {
-        // Skip ws:// trackers on https:// sites because they throw SecurityError
-        if (protocol === 'ws:' && typeof window !== 'undefined' &&
-            window.location.protocol === 'https:') {
-          nextTickWarn(new Error('Unsupported tracker protocol: ' + announceUrl))
-          return null
-        }
-        return new WebSocketTracker(self, announceUrl)
-      } else {
-        nextTickWarn(new Error('Unsupported tracker protocol: ' + announceUrl))
-        return null
-      }
+      return new Tracker(self, announceUrl, self._opts)
     })
-    .filter(Boolean)
-
-  function nextTickWarn (err) {
-    process.nextTick(function () {
-      self.emit('warning', err)
-    })
-  }
 }
 
 /**
- * Simple convenience function to scrape a tracker for an info hash without needing to
- * create a Client, pass it a parsed torrent, etc. Support scraping a tracker for multiple
- * torrents at the same time.
- * @params {Object} opts
- * @param  {string|Array.<string>} opts.infoHash
- * @param  {string} opts.announce
+ * Simple convenience function to scrape a tracker for an infoHash without
+ * needing to create a Client, pass it a parsed torrent, etc.
+ * @param  {string}   announceUrl
+ * @param  {string}   infoHash
  * @param  {function} cb
  */
-Client.scrape = function (opts, cb) {
+Client.scrape = function (announceUrl, infoHash, cb) {
   cb = once(cb)
-
-  if (!opts.infoHash) throw new Error('Option `infoHash` is required')
-  if (!opts.announce) throw new Error('Option `announce` is required')
-
-  var clientOpts = extend(opts, {
-    infoHash: Array.isArray(opts.infoHash) ? opts.infoHash[0] : opts.infoHash,
-    peerId: Buffer.from('01234567890123456789'), // dummy value
-    port: 6881 // dummy value
-  })
-
-  var client = new Client(clientOpts)
-  client.once('error', cb)
-  client.once('warning', cb)
-
-  var len = Array.isArray(opts.infoHash) ? opts.infoHash.length : 1
-  var results = {}
-  client.on('scrape', function (data) {
-    len -= 1
-    results[data.infoHash] = data
-    if (len === 0) {
-      client.destroy()
-      var keys = Object.keys(results)
-      if (keys.length === 1) {
-        cb(null, results[keys[0]])
-      } else {
-        cb(null, results)
-      }
+  var dummy = {
+    peerId: new Buffer('01234567890123456789'),
+    port: 6881,
+    torrent: {
+      infoHash: infoHash,
+      announce: [ announceUrl ]
     }
+  }
+  var client = new Client(dummy.peerId, dummy.port, dummy.torrent)
+  client.once('error', cb)
+  client.once('scrape', function (data) {
+    cb(null, data)
   })
-
-  opts.infoHash = Array.isArray(opts.infoHash)
-    ? opts.infoHash.map(function (infoHash) {
-      return Buffer.from(infoHash, 'hex')
-    })
-    : Buffer.from(opts.infoHash, 'hex')
-  client.scrape({ infoHash: opts.infoHash })
-  return client
+  client.scrape()
 }
 
-/**
- * Send a `start` announce to the trackers.
- * @param {Object} opts
- * @param {number=} opts.uploaded
- * @param {number=} opts.downloaded
- * @param {number=} opts.left (if not set, calculated automatically)
- */
 Client.prototype.start = function (opts) {
   var self = this
-  debug('send `start`')
-  opts = self._defaultAnnounceOpts(opts)
-  opts.event = 'started'
-  self._announce(opts)
-
-  // start announcing on intervals
   self._trackers.forEach(function (tracker) {
-    tracker.setInterval()
+    tracker.start(opts)
   })
 }
 
-/**
- * Send a `stop` announce to the trackers.
- * @param {Object} opts
- * @param {number=} opts.uploaded
- * @param {number=} opts.downloaded
- * @param {number=} opts.numwant
- * @param {number=} opts.left (if not set, calculated automatically)
- */
 Client.prototype.stop = function (opts) {
   var self = this
-  debug('send `stop`')
-  opts = self._defaultAnnounceOpts(opts)
-  opts.event = 'stopped'
-  self._announce(opts)
-}
-
-/**
- * Send a `complete` announce to the trackers.
- * @param {Object} opts
- * @param {number=} opts.uploaded
- * @param {number=} opts.downloaded
- * @param {number=} opts.numwant
- * @param {number=} opts.left (if not set, calculated automatically)
- */
-Client.prototype.complete = function (opts) {
-  var self = this
-  debug('send `complete`')
-  if (!opts) opts = {}
-  opts = self._defaultAnnounceOpts(opts)
-  opts.event = 'completed'
-  self._announce(opts)
-}
-
-/**
- * Send a `update` announce to the trackers.
- * @param {Object} opts
- * @param {number=} opts.uploaded
- * @param {number=} opts.downloaded
- * @param {number=} opts.numwant
- * @param {number=} opts.left (if not set, calculated automatically)
- */
-Client.prototype.update = function (opts) {
-  var self = this
-  debug('send `update`')
-  opts = self._defaultAnnounceOpts(opts)
-  if (opts.event) delete opts.event
-  self._announce(opts)
-}
-
-Client.prototype._announce = function (opts) {
-  var self = this
   self._trackers.forEach(function (tracker) {
-    // tracker should not modify `opts` object, it's passed to all trackers
-    tracker.announce(opts)
+    tracker.stop(opts)
   })
 }
 
-/**
- * Send a scrape request to the trackers.
- * @param {Object} opts
- */
+Client.prototype.complete = function (opts) {
+  var self = this
+  self._trackers.forEach(function (tracker) {
+    tracker.complete(opts)
+  })
+}
+
+Client.prototype.update = function (opts) {
+  var self = this
+  self._trackers.forEach(function (tracker) {
+    tracker.update(opts)
+  })
+}
+
 Client.prototype.scrape = function (opts) {
   var self = this
-  debug('send `scrape`')
-  if (!opts) opts = {}
   self._trackers.forEach(function (tracker) {
-    // tracker should not modify `opts` object, it's passed to all trackers
     tracker.scrape(opts)
   })
 }
 
 Client.prototype.setInterval = function (intervalMs) {
   var self = this
-  debug('setInterval %d', intervalMs)
+  self._intervalMs = intervalMs
+
   self._trackers.forEach(function (tracker) {
     tracker.setInterval(intervalMs)
   })
 }
 
-Client.prototype.destroy = function (cb) {
-  var self = this
-  if (self.destroyed) return
-  self.destroyed = true
-  debug('destroy')
+inherits(Tracker, EventEmitter)
 
-  var tasks = self._trackers.map(function (tracker) {
-    return function (cb) {
-      tracker.destroy(cb)
+/**
+ * An individual torrent tracker (used by Client)
+ *
+ * @param {Client} client       parent bittorrent tracker client
+ * @param {string} announceUrl  announce url of tracker
+ * @param {Object} opts         optional options
+ */
+function Tracker (client, announceUrl, opts) {
+  var self = this
+  EventEmitter.call(self)
+  self._opts = opts || {}
+
+  self.client = client
+
+  self._lastUploaded = 0
+
+  debug('new tracker %s', announceUrl)
+
+  self._announceUrl = announceUrl
+  self._intervalMs = self.client._intervalMs // use client interval initially
+  self._interval = null
+
+  if (self._announceUrl.indexOf('udp://') === 0) {
+    self._requestImpl = self._requestUdp
+  } else if (self._announceUrl.indexOf('http://') === 0) {
+    self._requestImpl = self._requestHttp
+  }
+}
+
+Tracker.prototype.start = function (opts) {
+  var self = this
+  opts = opts || {}
+  opts.event = 'started'
+
+  debug('sent `start` %s', self._announceUrl)
+  self._announce(opts)
+  self.setInterval(self._intervalMs) // start announcing on intervals
+}
+
+Tracker.prototype.stop = function (opts) {
+  var self = this
+  opts = opts || {}
+  opts.event = 'stopped'
+
+  debug('sent `stop` %s', self._announceUrl)
+  self._announce(opts)
+  self.setInterval(0) // stop announcing on intervals
+}
+
+Tracker.prototype.complete = function (opts) {
+  var self = this
+  opts = opts || {}
+  opts.event = 'completed'
+  opts.downloaded = opts.downloaded || self.torrentLength || 0
+
+  debug('sent `complete` %s', self._announceUrl)
+  self._announce(opts)
+}
+
+Tracker.prototype.update = function (opts) {
+  var self = this
+  opts = opts || {}
+
+  debug('sent `update` %s', self._announceUrl)
+  self._announce(opts)
+}
+
+/**
+ * Send an announce request to the tracker.
+ * @param {Object} opts
+ * @param {number=} opts.uploaded
+ * @param {number=} opts.downloaded
+ * @param {number=} opts.left (if not set, calculated automatically)
+ */
+Tracker.prototype._announce = function (opts) {
+  var self = this
+  opts = extend({
+    uploaded: 0, // default, user should provide real value
+    downloaded: 0 // default, user should provide real value
+  }, opts)
+
+  if (!opts.event && self.client.torrentLength != null && self.client.torrentLength <= opts.downloaded) {
+    if (opts.uploaded == self._lastUploaded) {
+      return
+    } else {
+      // fix update event if torrentLength larger then opts.downloaded
+      opts.left = 0
+      opts.downloaded = self.client.torrentLength
+    }
+  }
+
+  self._lastUploaded = opts.uploaded
+
+  if (self.client.torrentLength != null && opts.left == null) {
+    if (opts.event == 'completed') {
+      // if completed, fix announce to full
+      opts.left = 0
+      opts.downloaded = self.client.torrentLength
+    } else {
+      opts.left = self.client.torrentLength - (opts.downloaded || 0)
+    }
+  }
+
+  self._requestImpl(self._announceUrl, opts)
+}
+
+/**
+ * Send a scrape request to the tracker.
+ */
+Tracker.prototype.scrape = function () {
+  var self = this
+
+  self._scrapeUrl = self._scrapeUrl || getScrapeUrl(self._announceUrl)
+
+  if (!self._scrapeUrl) {
+    debug('scrape not supported %s', self._announceUrl)
+    self.client.emit('error', new Error('scrape not supported for announceUrl ' + self._announceUrl))
+    return
+  }
+
+  debug('sent `scrape` %s', self._announceUrl)
+  self._requestImpl(self._scrapeUrl, { _scrape: true })
+}
+
+Tracker.prototype.setInterval = function (intervalMs) {
+  var self = this
+  clearInterval(self._interval)
+
+  self._intervalMs = intervalMs
+  if (intervalMs) {
+    self._interval = setInterval(self.update.bind(self), self._intervalMs)
+  }
+}
+
+Tracker.prototype._requestHttp = function (requestUrl, opts) {
+  var self = this
+
+  if (opts._scrape) {
+    opts = extend({
+      info_hash: self.client._infoHash.toString('binary')
+    }, opts)
+  } else {
+    opts = extend({
+      info_hash: self.client._infoHash.toString('binary'),
+      peer_id: self.client._peerId.toString('binary'),
+      port: self.client._port,
+      compact: 1,
+      numwant: self.client._numWant
+    }, opts)
+
+    if (self._trackerId) {
+      opts.trackerid = self._trackerId
+    }
+  }
+
+  var fullUrl = requestUrl + '?' + common.querystringStringify(opts)
+
+  var req = http.get(fullUrl, function (res) {
+    if (res.statusCode !== 200) {
+      res.resume() // consume the whole stream
+      self.client.emit('warning', new Error('Invalid response code ' + res.statusCode + ' from tracker ' + requestUrl))
+      return
+    }
+    res.pipe(concat(function (data) {
+      if (data && data.length) self._handleResponse(requestUrl, data)
+    }))
+  })
+
+  req.on('error', function (err) {
+    self.client.emit('warning', err)
+  })
+}
+
+Tracker.prototype._requestUdp = function (requestUrl, opts) {
+  var self = this
+  opts = opts || {}
+  var parsedUrl = url.parse(requestUrl)
+  var socket = dgram.createSocket('udp4')
+  var transactionId = new Buffer(hat(32), 'hex')
+
+  var stopped = opts.event === 'stopped'
+  // if we're sending a stopped message, we don't really care if it arrives, so set
+  // a short timer and don't call error
+  var timeout = setTimeout(function () {
+    timeout = null
+    cleanup()
+    if (!stopped) {
+      error('tracker request timed out')
+    }
+  }, stopped ? 1500 : 15000)
+
+  if (timeout && timeout.unref) {
+    timeout.unref()
+  }
+
+  send(Buffer.concat([
+    common.CONNECTION_ID,
+    common.toUInt32(common.ACTIONS.CONNECT),
+    transactionId
+  ]))
+
+  socket.on('error', error)
+
+  socket.on('message', function (msg) {
+    if (msg.length < 8 || msg.readUInt32BE(4) !== transactionId.readUInt32BE(0)) {
+      return error('tracker sent back invalid transaction id')
+    }
+
+    var action = msg.readUInt32BE(0)
+    switch (action) {
+      case 0: // handshake
+        if (msg.length < 16) {
+          return error('invalid udp handshake')
+        }
+
+        if (opts._scrape) {
+          scrape(msg.slice(8, 16))
+        } else {
+          announce(msg.slice(8, 16), opts)
+        }
+
+        return
+
+      case 1: // announce
+        cleanup()
+        if (msg.length < 20) {
+          return error('invalid announce message')
+        }
+
+        var interval = msg.readUInt32BE(8)
+        if (interval && !self._opts.interval && self._intervalMs !== 0) {
+          // use the interval the tracker recommends, UNLESS the user manually specifies an
+          // interval they want to use
+          self.setInterval(interval * 1000)
+        }
+
+        self.client.emit('update', {
+          announce: self._announceUrl,
+          complete: msg.readUInt32BE(16),
+          incomplete: msg.readUInt32BE(12)
+        })
+
+        compact2string.multi(msg.slice(20)).forEach(function (addr) {
+          self.client.emit('peer', addr)
+        })
+        break
+
+      case 2: // scrape
+        cleanup()
+        if (msg.length < 20) {
+          return error('invalid scrape message')
+        }
+        self.client.emit('scrape', {
+          announce: self._announceUrl,
+          complete: msg.readUInt32BE(8),
+          downloaded: msg.readUInt32BE(12),
+          incomplete: msg.readUInt32BE(16)
+        })
+        break
+
+      case 3: // error
+        cleanup()
+        if (msg.length < 8) {
+          return error('invalid error message')
+        }
+        self.client.emit('error', new Error(msg.slice(8).toString()))
+        break
     }
   })
 
-  parallel(tasks, cb)
+  function send (message) {
+    if (!parsedUrl.port) {
+      parsedUrl.port = 80
+    }
+    socket.send(message, 0, message.length, parsedUrl.port, parsedUrl.hostname)
+  }
 
-  self._trackers = []
-  self._getAnnounceOpts = null
+  function error (message) {
+    // errors will often happen if a tracker is offline, so don't treat it as fatal
+    self.client.emit('warning', new Error(message + ' (' + requestUrl + ')'))
+    cleanup()
+  }
+
+  function cleanup () {
+    if (timeout) {
+      clearTimeout(timeout)
+      timeout = null
+    }
+    try { socket.close() } catch (err) {}
+  }
+
+  function genTransactionId () {
+    transactionId = new Buffer(hat(32), 'hex')
+  }
+
+  function announce (connectionId, opts) {
+    opts = opts || {}
+    genTransactionId()
+
+    send(Buffer.concat([
+      connectionId,
+      common.toUInt32(common.ACTIONS.ANNOUNCE),
+      transactionId,
+      self.client._infoHash,
+      self.client._peerId,
+      toUInt64(opts.downloaded || 0),
+      opts.left ? toUInt64(opts.left) : new Buffer('FFFFFFFFFFFFFFFF', 'hex'),
+      toUInt64(opts.uploaded || 0),
+      common.toUInt32(common.EVENTS[opts.event] || 0),
+      common.toUInt32(0), // ip address (optional)
+      common.toUInt32(0), // key (optional)
+      common.toUInt32(self.client._numWant),
+      toUInt16(self.client._port || 0)
+    ]))
+  }
+
+  function scrape (connectionId) {
+    genTransactionId()
+
+    send(Buffer.concat([
+      connectionId,
+      common.toUInt32(common.ACTIONS.SCRAPE),
+      transactionId,
+      self.client._infoHash
+    ]))
+  }
 }
 
-Client.prototype._defaultAnnounceOpts = function (opts) {
+Tracker.prototype._handleResponse = function (requestUrl, data) {
   var self = this
-  if (!opts) opts = {}
 
-  if (opts.numwant == null) opts.numwant = common.DEFAULT_ANNOUNCE_PEERS
+  try {
+    data = bencode.decode(data)
+  } catch (err) {
+    return self.client.emit('warning', new Error('Error decoding tracker response: ' + err.message))
+  }
+  var failure = data['failure reason']
+  if (failure) {
+    return self.client.emit('warning', new Error(failure))
+  }
 
-  if (opts.uploaded == null) opts.uploaded = 0
-  if (opts.downloaded == null) opts.downloaded = 0
+  var warning = data['warning message']
+  if (warning) {
+    self.client.emit('warning', new Error(warning))
+  }
 
-  if (self._getAnnounceOpts) opts = extend(opts, self._getAnnounceOpts())
-  return opts
+  if (requestUrl === self._announceUrl) {
+    var interval = data.interval || data['min interval']
+    if (interval && !self._opts.interval && self._intervalMs !== 0) {
+      // use the interval the tracker recommends, UNLESS the user manually specifies an
+      // interval they want to use
+      self.setInterval(interval * 1000)
+    }
+
+    var trackerId = data['tracker id']
+    if (trackerId) {
+      // If absent, do not discard previous trackerId value
+      self._trackerId = trackerId
+    }
+
+    self.client.emit('update', {
+      announce: self._announceUrl,
+      complete: data.complete,
+      incomplete: data.incomplete
+    })
+
+    if (Buffer.isBuffer(data.peers)) {
+      // tracker returned compact response
+      compact2string.multi(data.peers).forEach(function (addr) {
+        self.client.emit('peer', addr)
+      })
+    } else if (Array.isArray(data.peers)) {
+      // tracker returned normal response
+      data.peers.forEach(function (peer) {
+        var ip = peer.ip
+        var addr = ip[0] + '.' + ip[1] + '.' + ip[2] + '.' + ip[3] + ':' + peer.port
+        self.client.emit('peer', addr)
+      })
+    }
+  } else if (requestUrl === self._scrapeUrl) {
+    // NOTE: the unofficial spec says to use the 'files' key but i've seen 'host' in practice
+    data = data.files || data.host || {}
+    data = data[self.client._infoHash.toString('binary')]
+
+    if (!data) {
+      self.client.emit('warning', new Error('invalid scrape response'))
+    } else {
+      // TODO: optionally handle data.flags.min_request_interval (separate from announce interval)
+      self.client.emit('scrape', {
+        announce: self._announceUrl,
+        complete: data.complete,
+        incomplete: data.incomplete,
+        downloaded: data.downloaded
+      })
+    }
+  }
+}
+
+function toUInt16 (n) {
+  var buf = new Buffer(2)
+  buf.writeUInt16BE(n, 0)
+  return buf
+}
+
+var MAX_UINT = 4294967295
+
+function toUInt64 (n) {
+  if (n > MAX_UINT || typeof n === 'string') {
+    var bytes = new BN(n).toArray()
+    while (bytes.length < 8) {
+      bytes.unshift(0)
+    }
+    return new Buffer(bytes)
+  }
+  return Buffer.concat([common.toUInt32(0), common.toUInt32(n)])
+}
+
+var UDP_TRACKER = /^udp:\/\//
+var HTTP_SCRAPE_SUPPORT = /\/(announce)[^\/]*$/
+
+function getScrapeUrl (announceUrl) {
+  if (announceUrl.match(UDP_TRACKER)) return announceUrl
+  var match = announceUrl.match(HTTP_SCRAPE_SUPPORT)
+  if (match) {
+    var i = match.index
+    return announceUrl.slice(0, i) + '/scrape' + announceUrl.slice(i + 9)
+  }
+  return null
 }
