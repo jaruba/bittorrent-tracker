@@ -145,6 +145,8 @@ function Tracker (client, announceUrl, opts) {
   self.client = client
 
   self._lastUploaded = 0
+  self._lastDownloaded = 0
+  self._downloadComplete = false
 
   debug('new tracker %s', announceUrl)
 
@@ -211,27 +213,27 @@ Tracker.prototype._announce = function (opts) {
     downloaded: 0 // default, user should provide real value
   }, opts)
 
-  if (!opts.event && self.client.torrentLength != null && self.client.torrentLength <= opts.downloaded) {
+  if (!opts.event && self.client.torrentLength <= opts.downloaded) {
     if (opts.uploaded == self._lastUploaded) {
       return
-    } else {
-      // fix update event if torrentLength larger then opts.downloaded
-      opts.left = 0
-      opts.downloaded = self.client.torrentLength
+    } else if (!self._downloadComplete) {
+      opts.downloaded = self._lastDownloaded
     }
   }
 
-  self._lastUploaded = opts.uploaded
-
   if (self.client.torrentLength != null && opts.left == null) {
-    if (opts.event == 'completed') {
+    if (opts.event == 'completed' || self._downloadComplete) {
       // if completed, fix announce to full
+      self._downloadComplete = true
       opts.left = 0
       opts.downloaded = self.client.torrentLength
     } else {
       opts.left = self.client.torrentLength - (opts.downloaded || 0)
     }
   }
+
+  self._lastUploaded = opts.uploaded
+  self._lastDownloaded = opts.downloaded
 
   self._requestImpl(self._announceUrl, opts)
 }
